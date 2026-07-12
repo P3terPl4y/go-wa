@@ -20,8 +20,36 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
+// truncateHistory recorta el historial de mensajes para no superar MAX_HISTORY_CHARS
+// manteniendo los mensajes más recientes (prioridad al final del slice).
+func truncateHistory(history []models.ChatMessage) []models.ChatMessage {
+	total := 0
+	start := len(history)
+	for i := len(history) - 1; i >= 0; i-- {
+		total += len(history[i].Content)
+		if total > global.MAX_HISTORY_CHARS {
+			break
+		}
+		start = i
+	}
+	return history[start:]
+}
+
 func InitBot(botID int, qrResult chan<- string) {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// Fix 6: helper para enviar en el channel de forma segura (evita panic si ya está cerrado)
+	sendQR := func(val string) {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("⚠️ [Bot %d] Panic recuperado al enviar QR: %v\n", botID, r)
+			}
+		}()
+		if qrResult != nil {
+			qrResult <- val
+		}
+	}
+
 	defer func() {
 		cancel()
 		global.ActiveMu.Lock()
@@ -81,86 +109,165 @@ func InitBot(botID int, qrResult chan<- string) {
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
-			// 1. Ignorar mensajes de protocolo (sistema, sincronización)
-			if v.Message.GetProtocolMessage() != nil {
-				fmt.Printf("📩 [Bot %d] Mensaje de protocolo ignorado\n", botID)
-				return
-			}
-
-			// 2. Ignorar mensajes de grupos (si no quieres atender grupos)
-			if v.Info.IsGroup {
-				fmt.Printf("📩 [Bot %d] Mensaje de grupo ignorado\n", botID)
-				return
-			}
-
-			// 3. Obtener el texto del mensaje
-			text := v.Message.GetConversation()
-			if text == "" {
-				// No enviar respuesta automática, solo loguear
-				fmt.Printf("📩 [Bot %d] Mensaje sin texto de %s, ignorado\n", botID, v.Info.Sender.ToNonAD())
-				return
-			}
-
-			// 4. Verificar que el mensaje no sea de nosotros mismos (ya está hecho)
+			// 1. Ignorar mensajes propios
 			if v.Info.IsFromMe {
 				return
 			}
 
-			// 5. Verificar que el bot no esté bloqueado (ya está hecho)
-			bot, err := get.GetBotByID(botID)
-			if err != nil || bot == nil || bot.Blocked {
-				fmt.Printf("⛔ [Bot %d] Bot bloqueado o eliminado, ignorando mensaje\n", botID)
+			// 2. Ignorar mensajes de protocolo (sincronización interna)
+			if v.Message.GetProtocolMessage() != nil {
 				return
 			}
 
-			// Ahora procesamos el mensaje
+			// 3. Ignorar grupos
+			if v.Info.IsGroup {
+				return
+			}
+
+			// 4. Deduplicación: ignorar si ya procesamos este messageID (Mejora 2)
+			if global.MsgDedup.IsDuplicate(v.Info.ID) {
+				fmt.Printf("🔄 [Bot %d] Mensaje duplicado ignorado: %s\n", botID, v.Info.ID)
+				return
+			}
+
+			// 5. Extraer texto: soporta mensajes simples y extendidos (Mejora 4)
+			text := v.Message.GetConversation()
+			if text == "" {
+				if ext := v.Message.GetExtendedTextMessage(); ext != nil {
+					text = ext.GetText()
+				}
+			}
+			if text == "" {
+				fmt.Printf("📩 [Bot %d] Mensaje sin texto de %s, ignorado\n", botID, v.Info.Sender.ToNonAD())
+				return
+			}
+
+			// 6. Truncar mensajes demasiado largos (protege contra spam de tokens)
+			if len(text) > global.MAX_MSG_LENGTH {
+				text = text[:global.MAX_MSG_LENGTH] + "..."
+			}
+
 			senderJID := v.Info.Sender.ToNonAD()
+			userKey := fmt.Sprintf("%d:%s", botID, senderJID.String())
+
+			// 7. Semáforo por usuario: evita respuestas duplicadas si escribe rápido (Mejora 6)
+			if !global.UserSem.TryLock(userKey) {
+				fmt.Printf("⏳ [Bot %d] Ya procesando mensaje de %s, ignorado\n", botID, senderJID)
+				return
+			}
+
 			fmt.Printf("📩 [Bot %d] Mensaje de %s: %s\n", botID, senderJID, text)
 
-			go func(msg *events.Message, recipient types.JID, txt string) {
-				// Guardar historial
+			go func(recipient types.JID, txt string) {
+				defer global.UserSem.Unlock(userKey)
+
+				// 8. Verificar bot activo y no bloqueado (verificación rápida en memoria primero)
+				global.ActiveMu.Lock()
+				_, isActive := global.ActiveBots[botID]
+				global.ActiveMu.Unlock()
+				if !isActive {
+					return
+				}
+
+				// Guardar mensaje del usuario
 				if err := save.SaveChatMessage(botID, recipient.String(), "user", txt); err != nil {
 					fmt.Printf("❌ [Bot %d] Error guardando historial: %v\n", botID, err)
 				}
 
+				// Recuperar historial y truncar por caracteres (Mejora 3)
 				history, err := get.GetChatHistory(botID, recipient.String(), global.MAX_HISTORY)
 				if err != nil {
 					history = []models.ChatMessage{}
 				}
-				contexto, _ := get.GetPrompt(botID)
+				history = truncateHistory(history)
 
-				var promptBuilder strings.Builder
-				if contexto != "" {
-					promptBuilder.WriteString("Contexto: " + contexto + "\n\n")
+				// Obtener prompt del sistema desde cache (Mejora 1)
+				contexto, ok := global.PromptCache.Get(botID)
+				if !ok {
+					contexto, _ = get.GetPrompt(botID)
+					global.PromptCache.Set(botID, contexto)
 				}
+				if contexto == "" {
+					contexto = "Eres un asistente útil de WhatsApp. Responde de forma concisa."
+				}
+
+				// Construir prompt eficiente
+				var promptBuilder strings.Builder
+				promptBuilder.WriteString(contexto + "\n\n")
 				for _, m := range history {
-					if m.Role == "user" {
-						promptBuilder.WriteString("Usuario: " + m.Content + "\n")
-					} else if m.Role == "assistant" {
-						promptBuilder.WriteString("Asistente: " + m.Content + "\n")
+					switch m.Role {
+					case "user":
+						promptBuilder.WriteString("U: " + m.Content + "\n")
+					case "assistant":
+						promptBuilder.WriteString("A: " + m.Content + "\n")
 					}
 				}
-				promptBuilder.WriteString("Usuario: " + txt + "\n")
+				promptBuilder.WriteString("U: " + txt + "\nA:")
 
-				respuestaIA, err := ai.CallAI(promptBuilder.String())
-				if err != nil {
-					fmt.Printf("❌ [Bot %d] Error IA: %v\n", botID, err)
-					respuestaIA = "Lo siento, tuve un problema. Intenta de nuevo."
+				// Llamar a la IA con timeout controlado
+				type aiResult struct {
+					resp string
+					err  error
+				}
+				aiCh := make(chan aiResult, 1)
+				go func() {
+					r, e := ai.CallAI(promptBuilder.String())
+					aiCh <- aiResult{r, e}
+				}()
+
+				var respuestaIA string
+				select {
+				case res := <-aiCh:
+					if res.err != nil {
+						fmt.Printf("❌ [Bot %d] Error IA: %v\n", botID, res.err)
+						respuestaIA = "🤖 Lo siento, no pude procesar tu mensaje. Inténtalo de nuevo en un momento."
+					} else {
+						respuestaIA = res.resp
+					}
+				case <-time.After(global.AI_TIMEOUT_TOTAL):
+					fmt.Printf("⏱️ [Bot %d] Timeout IA para %s\n", botID, recipient)
+					respuestaIA = "🤖 Estoy tardando más de lo esperado. Inténtalo de nuevo."
 				}
 
+				// Guardar respuesta
 				if err := save.SaveChatMessage(botID, recipient.String(), "assistant", respuestaIA); err != nil {
 					fmt.Printf("❌ [Bot %d] Error guardando respuesta: %v\n", botID, err)
 				}
 
+				// Enviar respuesta a WhatsApp
 				_, err = client.SendMessage(context.Background(), recipient, &waE2E.Message{
 					Conversation: &respuestaIA,
 				})
 				if err != nil {
-					fmt.Printf("❌ [Bot %d] Error enviando respuesta a %s: %v\n", botID, recipient, err)
+					fmt.Printf("❌ [Bot %d] Error enviando a %s: %v\n", botID, recipient, err)
 				} else {
 					fmt.Printf("✅ [Bot %d] Respuesta enviada a %s\n", botID, recipient)
 				}
-			}(v, senderJID, text) // ... resto de eventos (Disconnected, StreamReplaced) sin cambios
+			}(senderJID, text)
+
+		case *events.Disconnected:
+			// Mejora 5: Reconexión automática al desconectarse
+			fmt.Printf("🔁 [Bot %d] Desconectado, reconectando...\n", botID)
+			go func() {
+				time.Sleep(3 * time.Second)
+				global.ActiveMu.Lock()
+				_, isActive := global.ActiveBots[botID]
+				global.ActiveMu.Unlock()
+				if !isActive {
+					return // el bot fue apagado intencionalmente
+				}
+				if err := functions.ConnectWithRetry(client); err != nil {
+					fmt.Printf("❌ [Bot %d] No se pudo reconectar: %v\n", botID, err)
+					cancel() // forzar cierre del lifecycle
+				} else {
+					fmt.Printf("✅ [Bot %d] Reconectado exitosamente\n", botID)
+				}
+			}()
+
+		case *events.StreamReplaced:
+			// Mejora 5: StreamReplaced ocurre cuando WhatsApp abre otra sesión
+			fmt.Printf("⚠️ [Bot %d] Sesión reemplazada por otro dispositivo\n", botID)
+			cancel()
 		}
 	})
 
@@ -170,9 +277,7 @@ func InitBot(botID int, qrResult chan<- string) {
 			fmt.Printf("❌ [Bot %d] No se pudo conectar: %v\n", botID, err)
 			return
 		}
-		if qrResult != nil {
-			qrResult <- "SESSION_EXISTS"
-		}
+		sendQR("SESSION_EXISTS")
 		fmt.Printf("🤖 [Bot %d] Activo.\n", botID)
 		functions.RunLifecycle(botID, client, ctx, cancel)
 		return
@@ -186,21 +291,22 @@ func InitBot(botID int, qrResult chan<- string) {
 	}
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("⚠️ [Bot %d] Panic recuperado en goroutine QR: %v\n", botID, r)
+			}
+		}()
 		for evt := range qrChan {
 			select {
 			case <-ctx.Done():
 				return
 			default:
 				if evt.Event == "code" {
-					if qrResult != nil {
-						qrResult <- evt.Code
-					}
+					sendQR(evt.Code)
 					fmt.Printf("⏳ [Bot %d] QR generado, expira en ~20s\n", botID)
 				} else if evt.Event == "timeout" {
 					fmt.Printf("⏰ [Bot %d] QR expirado.\n", botID)
-					if qrResult != nil {
-						qrResult <- "TIMEOUT"
-					}
+					sendQR("TIMEOUT")
 					cancel()
 					return
 				}

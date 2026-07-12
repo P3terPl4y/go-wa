@@ -40,5 +40,7 @@ func UpdateBotIDPrompt(c fiber.Ctx) error {
 	if err := save.SavePrompt(botID, req.Prompt); err != nil {
 		return c.JSON(fiber.Map{"status": "error", "message": "Error guardando prompt"})
 	}
+	// Invalidar cache de prompts para que el bot tome el nuevo valor de inmediato
+	global.PromptCache.Invalidate(botID)
 	return c.JSON(fiber.Map{"status": "ok"})
 }

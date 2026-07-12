@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"regexp"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -12,56 +15,103 @@ import (
 )
 
 // ============================================================
-// CONFIGURACIÓN
+// CONFIGURACIÓN — Las claves se cargan desde variables de entorno
 // ============================================================
-var (
-	OpenRouterAPIKey string = "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"
-	LegacyAPIKey     string = "apf_e9tf41wgk7am0l2499yr2eam"
-)
+func getOpenRouterAPIKey() string {
+	if k := os.Getenv("OPENROUTER_API_KEY"); k != "" {
+		return k
+	}
+	// Fallback de desarrollo (eliminar en producción)
+	return "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"
+}
+
+func getLegacyAPIKey() string {
+	if k := os.Getenv("LEGACY_API_KEY"); k != "" {
+		return k
+	}
+	// Fallback de desarrollo (eliminar en producción)
+	return "apf_e9tf41wgk7am0l2499yr2eam"
+}
 
 const (
 	openRouterURL = "https://openrouter.ai/api/v1/chat/completions"
 	legacyURL     = "https://apifreellm.com/api/v1/chat"
+	localAIURL    = "http://localhost:8080/v1/chat/completions"
 )
 
 // Lista de modelos gratuitos de OpenRouter
 var freeModels = []string{
 	"openrouter/free",
-	// puedes añadir más si quieres, pero con el round‑robin de fuentes
-	// esto solo sirve para balancear dentro de OpenRouter
 }
 
-var modelIndex uint32  // para round‑robin interno de OpenRouter
-var sourceIndex uint32 // para round‑robin entre fuentes (0: OpenRouter, 1: Legacy, 2: Local)
+var modelIndex uint32  // para round-robin interno de OpenRouter
+var sourceIndex uint32 // para round-robin entre fuentes (0: OpenRouter, 1: Legacy, 2: Local)
 
 // ============================================================
-// NUEVA FUNCIÓN CallAI CON ALTERNANCIA ESTRICTA
+// SANITIZACIÓN DE RESPUESTAS (Fix 1: tokens filtrados)
+// ============================================================
+
+var (
+	// Tokens especiales de plantillas ChatML (Qwen, Llama, etc.)
+	reChatmlTokens = regexp.MustCompile(`<\|[^|>]+\|>`)
+	// Bloques <think>...</think> de modelos con razonamiento extendido
+	reThinkBlocks = regexp.MustCompile(`(?s)<think>.*?</think>`)
+	// Líneas sueltas que solo contienen "assistant", "user", "system"
+	reRoleLines = regexp.MustCompile(`(?m)^\s*(assistant|user|system)\s*$`)
+)
+
+// sanitizeResponse limpia artefactos que los modelos LLM
+// no deben enviar al usuario final (tokens ChatML, etiquetas de pensamiento, etc.)
+func sanitizeResponse(text string) string {
+	text = reThinkBlocks.ReplaceAllString(text, "")
+	text = reChatmlTokens.ReplaceAllString(text, "")
+	text = reRoleLines.ReplaceAllString(text, "")
+	text = strings.TrimSpace(text)
+	// Colapsar múltiples saltos de línea consecutivos
+	reMultiNewline := regexp.MustCompile(`\n{3,}`)
+	text = reMultiNewline.ReplaceAllString(text, "\n\n")
+	return text
+}
+
+// ============================================================
+// CallAI CON FALLBACK AUTOMÁTICO (Fix 2)
 // ============================================================
 
 // CallAI alterna entre OpenRouter, Legacy y Local en cada llamada.
-// Devuelve la respuesta de la fuente que toca, o el error que esta produzca.
+// Si la fuente del turno falla, prueba las demás automáticamente.
 func CallAI(prompt string) (string, error) {
-	// Obtener el turno actual (0,1,2) e incrementar para la próxima
 	turn := atomic.AddUint32(&sourceIndex, 1) % 3
 
-	switch turn {
-	case 0:
-		return callOpenRouter(prompt) // esta función itera sobre freeModels
-	case 1:
-		return callLegacy(prompt)
-	case 2:
-		return Preguntar(prompt) // función local con go‑pherence
-	default:
-		return "", fmt.Errorf("turno inválido: %d", turn)
+	// Definir las fuentes en el orden que les corresponde según el turno
+	type source struct {
+		name string
+		fn   func(string) (string, error)
 	}
+	all := []source{
+		{"OpenRouter", callOpenRouter},
+		{"Legacy", callLegacy},
+		{"Local", Preguntar},
+	}
+
+	for i := 0; i < len(all); i++ {
+		idx := (int(turn) + i) % len(all)
+		s := all[idx]
+		resp, err := s.fn(prompt)
+		if err == nil && resp != "" {
+			if i > 0 {
+				fmt.Printf("⚠️ [AI] Fuente principal falló, respondió fallback: %s\n", s.name)
+			}
+			return resp, nil
+		}
+		fmt.Printf("⚠️ [AI] Fuente %s falló (intento %d): %v\n", s.name, i+1, err)
+	}
+	return "", fmt.Errorf("todas las fuentes de IA fallaron")
 }
 
 // ============================================================
-// IMPLEMENTACIÓN DE OPENROUTER (con su propio round‑robin de modelos)
+// IMPLEMENTACIÓN DE OPENROUTER
 // ============================================================
 
-// callOpenRouter prueba los modelos gratuitos en orden round‑robin
-// y devuelve la primera respuesta exitosa. Si todos fallan, retorna el último error.
 func callOpenRouter(prompt string) (string, error) {
 	var lastErr error
 	for i := 0; i < len(freeModels); i++ {
@@ -76,7 +126,6 @@ func callOpenRouter(prompt string) (string, error) {
 	return "", fmt.Errorf("todos los modelos gratuitos de OpenRouter fallaron: %w", lastErr)
 }
 
-// callOpenRouterWithModel ejecuta la petición a un modelo específico de OpenRouter
 func callOpenRouterWithModel(prompt, model string) (string, error) {
 	cc := client.New()
 	cc.SetTimeout(30 * time.Second)
@@ -86,12 +135,11 @@ func callOpenRouterWithModel(prompt, model string) (string, error) {
 		"messages": []map[string]string{
 			{"role": "user", "content": prompt},
 		},
-		"reasoning": map[string]bool{"enabled": true},
 	}
 
 	headers := map[string]string{
 		"Content-Type":  "application/json",
-		"Authorization": "Bearer " + OpenRouterAPIKey,
+		"Authorization": "Bearer " + getOpenRouterAPIKey(),
 		"HTTP-Referer":  "https://tudominio.com",
 		"X-Title":       "WhatsApp Bot",
 	}
@@ -127,7 +175,7 @@ func callOpenRouterWithModel(prompt, model string) (string, error) {
 		if choice, ok := choices[0].(map[string]interface{}); ok {
 			if message, ok := choice["message"].(map[string]interface{}); ok {
 				if content, ok := message["content"].(string); ok {
-					return content, nil
+					return sanitizeResponse(content), nil // Fix 1 aplicado
 				}
 			}
 		}
@@ -136,7 +184,7 @@ func callOpenRouterWithModel(prompt, model string) (string, error) {
 }
 
 // ============================================================
-// IMPLEMENTACIÓN DE LEGACY (sin cambios)
+// IMPLEMENTACIÓN DE LEGACY
 // ============================================================
 
 func callLegacy(prompt string) (string, error) {
@@ -145,7 +193,7 @@ func callLegacy(prompt string) (string, error) {
 	payload := map[string]string{"message": prompt}
 	headers := map[string]string{
 		"Content-Type":  "application/json",
-		"Authorization": "Bearer " + LegacyAPIKey,
+		"Authorization": "Bearer " + getLegacyAPIKey(),
 	}
 
 	resp, err := cc.Post(legacyURL, client.Config{
@@ -166,26 +214,17 @@ func callLegacy(prompt string) (string, error) {
 		return "", fmt.Errorf("error parseando Legacy: %v", err)
 	}
 
-	if respText, ok := result["response"].(string); ok && respText != "" {
-		return respText, nil
+	for _, key := range []string{"response", "message", "text"} {
+		if respText, ok := result[key].(string); ok && respText != "" {
+			return sanitizeResponse(respText), nil // Fix 1 aplicado
+		}
 	}
-	if respText, ok := result["message"].(string); ok && respText != "" {
-		return respText, nil
-	}
-	if respText, ok := result["text"].(string); ok && respText != "" {
-		return respText, nil
-	}
-	return "Sin respuesta", nil
+	return "", fmt.Errorf("Legacy no retornó texto válido")
 }
 
 // ============================================================
-// IMPLEMENTACIÓN LOCAL (go‑pherence)
+// IMPLEMENTACIÓN LOCAL (go-pherence) — Fix 3: formato ChatML correcto
 // ============================================================
-
-// Preguntar ejecuta el modelo local y devuelve la respuesta.
-// (Asegúrate de que el binario y el modelo estén en las rutas correctas)
-
-const localAIURL = "http://localhost:8080/v1/chat/completions"
 
 type ChatMessage struct {
 	Role    string `json:"role"`
@@ -196,6 +235,7 @@ type ChatRequest struct {
 	Model     string        `json:"model"`
 	Messages  []ChatMessage `json:"messages"`
 	MaxTokens int           `json:"max_tokens"`
+	Stream    bool          `json:"stream"`
 }
 
 type ChatResponse struct {
@@ -206,14 +246,18 @@ type ChatResponse struct {
 	} `json:"choices"`
 }
 
-// Preguntar usa el servidor local de go-pherence para generar una respuesta.
+// Preguntar llama al servidor local go-pherence usando formato ChatML
+// correcto con roles system/user para evitar que el modelo genere tokens de control.
 func Preguntar(prompt string) (string, error) {
 	reqBody := ChatRequest{
-		Model: "qwen3-0.6b", // cualquier nombre, el servidor usará el que cargó
+		Model: "qwen3-0.6b",
 		Messages: []ChatMessage{
+			// El rol "system" establece el contexto sin confundir al modelo
+			{Role: "system", Content: "Eres un asistente de WhatsApp. Responde de forma concisa, clara y en el mismo idioma del usuario. No incluyas etiquetas, tokens ni marcadores internos en tu respuesta."},
 			{Role: "user", Content: prompt},
 		},
-		MaxTokens: 100,
+		MaxTokens: 300,
+		Stream:    false,
 	}
 
 	jsonData, err := json.Marshal(reqBody)
@@ -221,7 +265,8 @@ func Preguntar(prompt string) (string, error) {
 		return "", fmt.Errorf("error al marshal: %v", err)
 	}
 
-	resp, err := http.Post(localAIURL, "application/json", bytes.NewBuffer(jsonData))
+	httpClient := &http.Client{Timeout: 20 * time.Second}
+	resp, err := httpClient.Post(localAIURL, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return "", fmt.Errorf("error al llamar al servidor local: %v", err)
 	}
@@ -236,9 +281,9 @@ func Preguntar(prompt string) (string, error) {
 		return "", fmt.Errorf("error al decodificar respuesta: %v", err)
 	}
 
-	if len(chatResp.Choices) == 0 {
+	if len(chatResp.Choices) == 0 || chatResp.Choices[0].Message.Content == "" {
 		return "", fmt.Errorf("no se recibieron respuestas del servidor local")
 	}
 
-	return chatResp.Choices[0].Message.Content, nil
+	return sanitizeResponse(chatResp.Choices[0].Message.Content), nil // Fix 1 aplicado
 }

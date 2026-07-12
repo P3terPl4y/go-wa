@@ -17,7 +17,8 @@ func CountBotsByUser(userID int) (int, error) {
 }
 
 func RunLifecycle(botID int, client *whatsmeow.Client, ctx context.Context, cancel context.CancelFunc) {
-	ticker := time.NewTicker(5 * time.Second)
+	// Fix 5: reducido de 5s a 60s para minimizar carga en DB con múltiples bots activos
+	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {

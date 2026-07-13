@@ -1,8 +1,0 @@
-cd /var/www/lucifer/Wago/src/
-systemctl restart postgresql
-export DATABASE_URL="postgres://admin_gowa:go-wa333P3ter*@localhost:5433/gowa_db?sslmode=disable"
-export ENCRYPTION_KEY="ceab8097154ba180f586a3a6d87593db88062db792dc89452f01cb031c218e93"
-export COOKIE_SECURE="true"
-export REDIS_URL="redis://localhost:6379/0"
-nohup ./main > logs.log 2>&1 &
-cat logs.log

@@ -74,9 +74,9 @@ func notifyAdmin(clientJID types.JID, msg string) {
 		return
 	}
 	// Construir mensaje
-	notif := fmt.Sprintf("📦 Pedido/Cita de %s:\n%s", clientJID, msg)
+	fmt.Printf("📦 Pedido/Cita de %s:\n%s", clientJID, msg)
 	// Aquí deberías enviar el mensaje usando global.AdminBotClient y global.AdminJID
 	// ...
-	go notifyAdmin(recipient, notif)
+	
 	fmt.Printf("📦 Notificación al admin de %s: %s\n", clientJID, msg)
 }

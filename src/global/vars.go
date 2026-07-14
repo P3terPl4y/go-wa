@@ -36,7 +36,7 @@ var (
 	ActiveBots        = make(map[int]bool)
 	ActiveMu          sync.Mutex
 	WrMu              sync.RWMutex
-	SenderJIDsBlocked map[types.JID]bool
+	SenderJIDsBlocked = make(map[types.JID]bool) // inicializado vacío
 )
 
 // global.go

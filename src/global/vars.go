@@ -8,7 +8,9 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	goredis "github.com/redis/go-redis/v9"
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types"
 	"golang.org/x/oauth2"
 )
 
@@ -29,10 +31,18 @@ func getEnvOrDefault(key, defaultVal string) string {
 }
 
 var (
-	Containers   = make(map[int]*sqlstore.Container)
-	ContainersMu sync.Mutex
-	ActiveBots   = make(map[int]bool)
-	ActiveMu     sync.Mutex
+	Containers        = make(map[int]*sqlstore.Container)
+	ContainersMu      sync.Mutex
+	ActiveBots        = make(map[int]bool)
+	ActiveMu          sync.Mutex
+	WrMu              sync.RWMutex
+	SenderJIDsBlocked map[types.JID]bool
+)
+
+// global.go
+var (
+	AdminBotClient *whatsmeow.Client
+	AdminJID       types.JID
 )
 
 const (

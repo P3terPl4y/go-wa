@@ -1,39 +1,23 @@
 package create
 
 import (
+	wago "App/src/controllers/bot"
 	"App/src/controllers/get"
 	"App/src/controllers/save"
 	"App/src/global"
 	"App/src/global/functions"
-	"App/src/models"
-	"App/src/services/ai"
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 	"time"
 
 	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/proto/waE2E"
-	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
 // truncateHistory recorta el historial de mensajes para no superar MAX_HISTORY_CHARS
 // manteniendo los mensajes más recientes (prioridad al final del slice).
-func truncateHistory(history []models.ChatMessage) []models.ChatMessage {
-	total := 0
-	start := len(history)
-	for i := len(history) - 1; i >= 0; i-- {
-		total += len(history[i].Content)
-		if total > global.MAX_HISTORY_CHARS {
-			break
-		}
-		start = i
-	}
-	return history[start:]
-}
 
 func InitBot(botID int, qrResult chan<- string) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -158,92 +142,7 @@ func InitBot(botID int, qrResult chan<- string) {
 
 			fmt.Printf("📩 [Bot %d] Mensaje de %s: %s\n", botID, senderJID, text)
 
-			go func(recipient types.JID, txt string) {
-				defer global.UserSem.Unlock(userKey)
-
-				// 8. Verificar bot activo y no bloqueado (verificación rápida en memoria primero)
-				global.ActiveMu.Lock()
-				_, isActive := global.ActiveBots[botID]
-				global.ActiveMu.Unlock()
-				if !isActive {
-					return
-				}
-
-				// Guardar mensaje del usuario
-				if err := save.SaveChatMessage(botID, recipient.String(), "user", txt); err != nil {
-					fmt.Printf("❌ [Bot %d] Error guardando historial: %v\n", botID, err)
-				}
-
-				// Recuperar historial y truncar por caracteres (Mejora 3)
-				history, err := get.GetChatHistory(botID, recipient.String(), global.MAX_HISTORY)
-				if err != nil {
-					history = []models.ChatMessage{}
-				}
-				history = truncateHistory(history)
-
-				// Obtener prompt del sistema desde cache (Mejora 1)
-				contexto, ok := global.PromptCache.Get(botID)
-				if !ok {
-					contexto, _ = get.GetPrompt(botID)
-					global.PromptCache.Set(botID, contexto)
-				}
-				if contexto == "" {
-					contexto = "Eres un asistente útil de WhatsApp. Responde de forma concisa."
-				}
-
-				// Construir prompt eficiente
-				var promptBuilder strings.Builder
-				promptBuilder.WriteString(contexto + "\n\n")
-				for _, m := range history {
-					switch m.Role {
-					case "user":
-						promptBuilder.WriteString("U: " + m.Content + "\n")
-					case "assistant":
-						promptBuilder.WriteString("A: " + m.Content + "\n")
-					}
-				}
-				promptBuilder.WriteString("U: " + txt + "\nA:")
-
-				// Llamar a la IA con timeout controlado
-				type aiResult struct {
-					resp string
-					err  error
-				}
-				aiCh := make(chan aiResult, 1)
-				go func() {
-					r, e := ai.CallAI(promptBuilder.String())
-					aiCh <- aiResult{r, e}
-				}()
-
-				var respuestaIA string
-				select {
-				case res := <-aiCh:
-					if res.err != nil {
-						fmt.Printf("❌ [Bot %d] Error IA: %v\n", botID, res.err)
-						respuestaIA = "🤖 Lo siento, no pude procesar tu mensaje. Inténtalo de nuevo en un momento."
-					} else {
-						respuestaIA = res.resp
-					}
-				case <-time.After(global.AI_TIMEOUT_TOTAL):
-					fmt.Printf("⏱️ [Bot %d] Timeout IA para %s\n", botID, recipient)
-					respuestaIA = "🤖 Estoy tardando más de lo esperado. Inténtalo de nuevo."
-				}
-
-				// Guardar respuesta
-				if err := save.SaveChatMessage(botID, recipient.String(), "assistant", respuestaIA); err != nil {
-					fmt.Printf("❌ [Bot %d] Error guardando respuesta: %v\n", botID, err)
-				}
-
-				// Enviar respuesta a WhatsApp
-				_, err = client.SendMessage(context.Background(), recipient, &waE2E.Message{
-					Conversation: &respuestaIA,
-				})
-				if err != nil {
-					fmt.Printf("❌ [Bot %d] Error enviando a %s: %v\n", botID, recipient, err)
-				} else {
-					fmt.Printf("✅ [Bot %d] Respuesta enviada a %s\n", botID, recipient)
-				}
-			}(senderJID, text)
+			go wago.Switch(client, userKey, botID, senderJID, text)
 
 		case *events.Disconnected:
 			// Mejora 5: Reconexión automática al desconectarse

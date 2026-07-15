@@ -135,10 +135,10 @@ func InitBot(botID int, qrResult chan<- string) {
 			userKey := fmt.Sprintf("%d:%s", botID, senderJID.String())
 
 			// 7. Semáforo por usuario: evita respuestas duplicadas si escribe rápido (Mejora 6)
-			if !global.UserSem.TryLock(userKey) {
+			/*if !global.UserSem.TryLock(userKey) {
 				fmt.Printf("⏳ [Bot %d] Ya procesando mensaje de %s, ignorado\n", botID, senderJID)
 				return
-			}
+			}*/
 
 			fmt.Printf("📩 [Bot %d] Mensaje de %s: %s\n", botID, senderJID, text)
 

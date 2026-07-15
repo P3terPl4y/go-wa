@@ -4,7 +4,6 @@ import (
 	"App/src/controllers/get"
 	"App/src/database"
 	"App/src/global"
-	"App/src/global/functions"
 	"App/src/middleware"
 	"App/src/router"
 	"context"
@@ -21,6 +20,10 @@ import (
 	"go.mau.fi/whatsmeow"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	
+    // ... tus imports existentes ...
+    "time"
+
 )
 
 func init() {
@@ -40,51 +43,63 @@ func init() {
 // ============================================================
 // SERVIDOR WEB
 // ============================================================
-func startAdminBot(botID int) {
-	ctx := context.Background()
-	container := get.GetContainer(botID) // reutiliza la función global
-	deviceStore, err := container.GetFirstDevice(ctx)
-	if err != nil {
-		log.Printf("❌ Admin bot: error obteniendo dispositivo: %v", err)
+func startAdminBot() {
+	// Obtener usuario admin
+	adminUser, err := get.GetUserByUsername(global.ADMIN_USERNAME)
+	if err != nil || adminUser == nil {
+		log.Println("⚠️ No se encontró usuario admin")
 		return
 	}
-	clientLog := waLog.Stdout("AdminClient", "WARN", true)
-	client := whatsmeow.NewClient(deviceStore, clientLog)
-	// Conectar
-	if err := client.Connect(); err != nil {
-		log.Printf("❌ Admin bot: error conectando: %v", err)
+	bots, err := get.GetBotsByUser(adminUser.ID)
+	if err != nil || len(bots) == 0 {
+		log.Println("⚠️ El admin no tiene ningún bot. Crea uno manualmente desde el panel.")
 		return
 	}
-	// Guardar en global
-	global.AdminBotClient = client
-	// Obtener el JID del admin (su propio número)
-	if client.Store.ID != nil {
-		global.AdminJID = client.Store.LID
-		log.Printf("✅ Admin bot activo como %s", global.AdminJID)
-	} else {
-		log.Println("⚠️ Admin bot: no se pudo obtener el JID")
-	}
-	// Mantener el bot corriendo (runLifecycle para admin)
-	ctx2, cancel := context.WithCancel(ctx)
-	go functions.RunLifecycle(botID, client, ctx2, cancel) // reutiliza la función existente
+	adminBot := bots[0]
+
+	go func() {
+		for {
+			ctx := context.Background()
+			container := get.GetContainer(adminBot.ID)
+			deviceStore, err := container.GetFirstDevice(ctx)
+			if err != nil {
+				log.Printf("❌ Admin bot: error obteniendo dispositivo: %v", err)
+				time.Sleep(10 * time.Second)
+				continue
+			}
+
+			clientLog := waLog.Stdout("AdminClient", "WARN", true)
+			client := whatsmeow.NewClient(deviceStore, clientLog)
+
+			if err := client.Connect(); err != nil {
+				log.Printf("❌ Admin bot: error conectando: %v", err)
+				time.Sleep(10 * time.Second)
+				continue
+			}
+
+			// Guardar en global
+			global.AdminBotClient = client
+			if client.Store.ID != nil {
+				global.AdminJID = *client.Store.ID
+				log.Printf("✅ Admin bot activo como %s", global.AdminJID)
+			} else {
+				log.Println("⚠️ Admin bot: no se pudo obtener el JID")
+			}
+
+			// Mantener la goroutine viva y verificar conexión cada 30 segundos
+			// Si la conexión se cae, el bucle exterior lo detectará al reintentar
+			time.Sleep(30 * time.Second)
+		}
+	}()
 }
 func main() {
 	database.InitDB()
 	// Obtener el usuario admin
-	adminUser, err := get.GetUserByUsername("admin")
-	if err != nil || adminUser == nil {
-		log.Println("⚠️ No se encontró usuario admin, no se puede iniciar bot admin")
-	} else {
-		// Obtener su bot (suponemos que solo tiene uno)
-		bots, err := get.GetBotsByUser(adminUser.ID)
-		if err != nil || len(bots) == 0 {
-			log.Println("⚠️ El admin no tiene ningún bot. Crea uno manualmente.")
-		} else {
-			adminBot := bots[0]
+	 
 			// Iniciar el bot del admin en segundo plano y capturar el cliente
-			go startAdminBot(adminBot.ID)
-		}
-	}
+			go startAdminBot()
+		
+	
 	app := fiber.New(fiber.Config{
 		TrustProxy: true,
 		ErrorHandler: func(c fiber.Ctx, err error) error {

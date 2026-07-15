@@ -8,13 +8,14 @@ import (
 )
 
 func Dashboard(c fiber.Ctx) error {
+app.Get("/dashboard", authRequired, func(c fiber.Ctx) error {
 	userID := c.Locals("user_id").(int)
 	role := c.Locals("role").(string)
-	user, err := get.GetUserByID(userID)
+	user, err := getUserByID(userID)
 	if err != nil || user == nil {
 		return c.Status(500).JSON(fiber.Map{"error": "Usuario no encontrado"})
 	}
-	bots, err := get.GetBotsByUser(userID)
+	bots, err := getBotsByUser(userID)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": "Error al obtener bots"})
 	}
@@ -29,11 +30,10 @@ func Dashboard(c fiber.Ctx) error {
 		botID = bot.ID
 		paymentStatus = bot.PaymentStatus
 		botInfo = fmt.Sprintf("Bot ID: %d | Bloqueado: %v | Pago: %s", bot.ID, bot.Blocked, bot.PaymentStatus)
-		prompt, _ := get.GetPrompt(bot.ID)
+		prompt, _ := GetPrompt(bot.ID)
 		currentPrompt = prompt
 	}
 
-	// ... (código Go que prepara las variables user, botID, etc. se mantiene igual) ...
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -70,6 +70,7 @@ func Dashboard(c fiber.Ctx) error {
         @keyframes pulse-dot { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.5; transform: scale(0.8); } }
         .qr-wrapper { margin-top: 24px; padding: 24px; background: var(--color-bg-base); border-radius: 16px; border: 1px solid var(--color-border); display: flex; flex-direction: column; align-items: center; gap: 16px; }
         .qr-wrapper img { border-radius: 12px; background: #fff; padding: 12px; max-width: 240px; width: 100%; height: auto; }
+        .my-4 { margin: 24px 0; }
         @media(max-width: 640px) { .header { flex-direction: column; align-items: flex-start; } .user-badge { width: 100%; justify-content: center; } .btn-group { flex-direction: column; } .btn-group .btn { width: 100%; } }
     </style>
 </head>
@@ -111,17 +112,20 @@ func Dashboard(c fiber.Ctx) error {
             </div>
         </div>
 
+        <!-- Perfil -->
         <div id="perfil" class="premium-card glass-card mb-4 reveal">
             <div class="premium-card-body">
                 <div class="card-header"><div class="icon"><i class="fas fa-user"></i></div><h3>Perfil</h3></div>
                 <div class="user-info-grid">
                     <div class="user-info-item"><div class="label">Usuario</div><div class="value" id="infoUser">—</div></div>
                     <div class="user-info-item"><div class="label">Email</div><div class="value" id="infoEmail">—</div></div>
+                    <div class="user-info-item"><div class="label">Teléfono</div><div class="value" id="infoPhone">—</div></div>
                     <div class="user-info-item"><div class="label">Rol</div><div class="value" id="infoRole">—</div></div>
                 </div>
             </div>
         </div>
 
+        <!-- Bot -->
         <div id="bot" class="premium-card glass-card mb-4 reveal delay-1">
             <div class="premium-card-body">
                 <div class="card-header justify-between w-full">
@@ -148,6 +152,7 @@ func Dashboard(c fiber.Ctx) error {
             </div>
         </div>
 
+        <!-- Prompt -->
         <div id="prompt" class="premium-card glass-card mb-4 reveal delay-2">
             <div class="premium-card-body">
                 <div class="card-header"><div class="icon"><i class="fas fa-cog"></i></div><h3>Configurar Prompt</h3></div>
@@ -160,9 +165,22 @@ func Dashboard(c fiber.Ctx) error {
             </div>
         </div>
 
+        <!-- Seguridad -->
         <div id="seguridad" class="premium-card glass-card mb-4 reveal delay-3">
             <div class="premium-card-body">
                 <div class="card-header"><div class="icon"><i class="fas fa-key"></i></div><h3>Seguridad</h3></div>
+
+                <!-- Actualizar Teléfono -->
+                <div class="form-group">
+                    <label for="newPhone">Nuevo número de teléfono (formato internacional)</label>
+                    <input type="text" class="form-control" id="newPhone" placeholder="+521234567890" />
+                </div>
+                <button class="btn btn-primary" id="updatePhoneBtn"><i class="fas fa-phone"></i> Actualizar Teléfono</button>
+                <div id="phoneStatus" class="status-msg hidden"></div>
+
+                <hr class="my-4" />
+
+                <!-- Actualizar Contraseña -->
                 <div class="form-group">
                     <label for="newPass">Nueva contraseña</label>
                     <input type="password" class="form-control" id="newPass" placeholder="Ingresa tu nueva contraseña…" />
@@ -171,18 +189,20 @@ func Dashboard(c fiber.Ctx) error {
                 <div id="passStatus" class="status-msg hidden"></div>
             </div>
         </div>
-        
+
         <div class="flex justify-between items-center mt-4 mb-4">
             <span class="text-muted text-xs">Wago Panel &copy; 2026</span>
         </div>
     </main>
 </div>
+
 <script>
 (function(){
     const $=id=>document.getElementById(id);
     let botID = window.botID || 0;
     const userDisplay = window.userDisplay || 'Usuario';
     const userEmail = window.userEmail || 'usuario@email.com';
+    const userPhone = window.userPhone || '—';
     const userRole = window.userRole || 'usuario';
     let paymentStatus = window.paymentStatus || 'free';
 
@@ -191,6 +211,7 @@ func Dashboard(c fiber.Ctx) error {
     $('avatarLetter').textContent = userDisplay.charAt(0).toUpperCase();
     $('infoUser').textContent = userDisplay;
     $('infoEmail').textContent = userEmail;
+    $('infoPhone').textContent = userPhone;
     $('infoRole').textContent = userRole;
     if (botID) $('botIdBadge').textContent = 'ID: ' + botID;
 
@@ -243,6 +264,7 @@ func Dashboard(c fiber.Ctx) error {
         updatePaymentStatusMsg(window.paymentStatus);
     }
 
+    // Iniciar Bot
     $('startBotBtn').addEventListener('click', function(){
         const status=$('status'); hideStatus(status); hideQR();
         showStatus(status, '⏳ Procesando...', 'info');
@@ -261,6 +283,7 @@ func Dashboard(c fiber.Ctx) error {
         }).catch(err=>{ hideQR(); setBotStatus('error','Error'); showStatus(status, '❌ Error de red: '+err.message, 'error'); });
     });
 
+    // Refrescar estado
     $('refreshStatusBtn').addEventListener('click', function(){
         const status=$('status'); hideStatus(status); showStatus(status, '⟳ Actualizando…', 'info');
         fetch('/bot/'+botID+'/status', {method:'GET'})
@@ -273,6 +296,7 @@ func Dashboard(c fiber.Ctx) error {
         }).catch(err=>{ setBotStatus('error','Error'); hideQR(); showStatus(status, '❌ Error al obtener estado: '+err.message, 'error'); });
     });
 
+    // Actualizar Prompt
     $('updatePromptBtn').addEventListener('click', function(){
         const prompt=$('promptInput').value.trim(), status=$('promptStatus');
         hideStatus(status);
@@ -285,6 +309,42 @@ func Dashboard(c fiber.Ctx) error {
         }).catch(()=>{ showStatus(status, '❌ Error de red', 'error'); });
     });
 
+    // Actualizar Teléfono
+    $('updatePhoneBtn').addEventListener('click', function(){
+        const phone = $('newPhone').value.trim();
+        const status = $('phoneStatus');
+        hideStatus(status);
+        if (!phone) {
+            showStatus(status, '❌ Ingresa un número de teléfono', 'error');
+            return;
+        }
+        if (phone.length < 8) {
+            showStatus(status, '❌ El número debe tener al menos 8 caracteres', 'error');
+            return;
+        }
+        showStatus(status, '⏳ Actualizando...', 'info');
+        fetch('/user/phone', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ phone: phone })
+        })
+        .then(r => r.json())
+        .then(d => {
+            if (d.status === 'ok' || d.status === 'success') {
+                showStatus(status, '✅ Teléfono actualizado correctamente', 'success');
+                $('infoPhone').textContent = phone;
+                $('newPhone').value = '';
+                window.userPhone = phone; // Actualizar variable global
+            } else {
+                showStatus(status, '❌ ' + (d.error || d.message || 'Error al actualizar'), 'error');
+            }
+        })
+        .catch(() => {
+            showStatus(status, '❌ Error de red', 'error');
+        });
+    });
+
+    // Cambiar Contraseña
     $('changePassBtn').addEventListener('click', function(){
         const pass=$('newPass').value.trim(), status=$('passStatus');
         hideStatus(status);
@@ -298,16 +358,19 @@ func Dashboard(c fiber.Ctx) error {
         }).catch(()=>{ showStatus(status, '❌ Error de red', 'error'); });
     });
 
+    // Cerrar sesión
     $('logoutBtn').addEventListener('click', function(){ fetch('/logout', {method:'POST'}).then(()=>window.location.href='/').catch(()=>window.location.href='/'); });
 
     setTimeout(function(){ const btn=$('refreshStatusBtn'); if(btn) btn.click(); }, 300);
 
+    // Enter key support
     $('newPass').addEventListener('keydown', function(e){ if(e.key==='Enter'){ e.preventDefault(); $('changePassBtn').click(); } });
+    $('newPhone').addEventListener('keydown', function(e){ if(e.key==='Enter'){ e.preventDefault(); $('updatePhoneBtn').click(); } });
     $('promptInput').addEventListener('keydown', function(e){ if(e.key==='Enter' && e.ctrlKey){ e.preventDefault(); $('updatePromptBtn').click(); } });
 
     window.botID = botID;
-    
-    // Smooth scrolling for sidebar links
+
+    // Navegación sidebar
     document.querySelectorAll('.sidebar-item').forEach(item => {
         item.addEventListener('click', function(e) {
             e.preventDefault();
@@ -321,7 +384,7 @@ func Dashboard(c fiber.Ctx) error {
         });
     });
 
-    // Theme Toggle Logic
+    // Theme Toggle
     const themeToggleDash = document.getElementById('themeToggleDash');
     if (themeToggleDash) {
         const icon = themeToggleDash.querySelector('i');
@@ -341,11 +404,11 @@ func Dashboard(c fiber.Ctx) error {
             }
         });
     }
-
 })();
 </script>
 </body>
-</html>`, role, user.Username, user.Email, role, botInfo, currentPrompt, botID, paymentStatus)
+</html>`, role, user.Username, user.Email, user.Phone, role, botInfo, currentPrompt, botID, paymentStatus)
+
 	c.Set("Content-Type", "text/html")
 	return c.SendString(html)
-}
+})
